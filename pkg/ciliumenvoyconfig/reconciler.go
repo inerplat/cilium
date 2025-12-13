@@ -85,9 +85,6 @@ func (ops *envoyOps) Prune(ctx context.Context, txn statedb.ReadTxn, objects ite
 	return nil
 }
 
-// isPortBindingError checks if the error is related to port binding failure.
-// It checks both ProxyError.Detail and the error message string for common
-// port binding failure indicators.
 func isPortBindingError(err error) bool {
 	if err == nil {
 		return false
@@ -95,7 +92,6 @@ func isPortBindingError(err error) bool {
 
 	var proxyErr *xds.ProxyError
 	if errors.As(err, &proxyErr) {
-		// Check ProxyError.Detail field which contains the actual Envoy error message
 		detail := strings.ToLower(proxyErr.Detail)
 		if strings.Contains(detail, "cannot bind") ||
 			strings.Contains(detail, "address already in use") ||
@@ -104,16 +100,14 @@ func isPortBindingError(err error) bool {
 		}
 	}
 
-	// Fallback to checking the error message itself
 	errStr := strings.ToLower(err.Error())
 	return strings.Contains(errStr, "cannot bind") ||
 		strings.Contains(errStr, "address already in use") ||
 		strings.Contains(errStr, "eaddrinuse")
 }
 
-// retryWithNewPorts attempts to reallocate ports for listeners that failed to bind
-// and retries UpdateEnvoyResources. Only listeners that need port reallocation are cloned.
-func (ops *envoyOps) retryWithNewPorts(ctx context.Context, prevResources, resources envoy.Resources) error {
+// retryWithNewPorts reallocates dynamically allocated ports and retries UpdateEnvoyResources.
+func (ops *envoyOps) retryWithNewPorts(ctx context.Context, prevResources, resources envoy.Resources) (envoy.Resources, error) {
 	newListeners := make([]*envoy_config_listener.Listener, 0, len(resources.Listeners))
 
 	for _, listener := range resources.Listeners {
@@ -122,15 +116,15 @@ func (ops *envoyOps) retryWithNewPorts(ctx context.Context, prevResources, resou
 			continue
 		}
 
-		if listener.GetAddress() != nil {
-			listenerName := listener.Name
+		listenerName := listener.Name
 
-			newPort, err := ops.portAllocator.AllocateCRDProxyPortWithReallocate(listenerName, true)
+		if resources.PortAllocationCallbacks != nil && resources.PortAllocationCallbacks[listenerName] != nil {
+			newPort, err := ops.portAllocator.ReallocateCRDProxyPort(listenerName)
 			if err != nil || newPort == 0 {
 				ops.log.Error("Failed to reallocate proxy port",
 					logfields.Listener, listenerName,
 					logfields.Error, err)
-				return err
+				return resources, err
 			}
 
 			clonedListener := proto.Clone(listener).(*envoy_config_listener.Listener)
@@ -154,7 +148,8 @@ func (ops *envoyOps) retryWithNewPorts(ctx context.Context, prevResources, resou
 	}
 
 	resources.Listeners = newListeners
-	return ops.xds.UpdateEnvoyResources(ctx, prevResources, resources)
+	err := ops.xds.UpdateEnvoyResources(ctx, prevResources, resources)
+	return resources, err
 }
 
 // Update implements reconciler.Operations.
@@ -167,23 +162,56 @@ func (ops *envoyOps) Update(ctx context.Context, txn statedb.ReadTxn, _ statedb.
 	var prevResources envoy.Resources
 	if res.ReconciledResources != nil {
 		prevResources = *res.ReconciledResources
+
+		// Use previously reconciled listener addresses for dynamically allocated ports.
+		if resources.PortAllocationCallbacks != nil {
+			reconciledListenersByName := make(map[string]*envoy_config_listener.Listener)
+			for _, l := range prevResources.Listeners {
+				reconciledListenersByName[l.Name] = l
+			}
+			for i, l := range resources.Listeners {
+				if _, hasCb := resources.PortAllocationCallbacks[l.Name]; hasCb {
+					if reconciledL, ok := reconciledListenersByName[l.Name]; ok {
+						resources.Listeners[i].Address = reconciledL.Address
+						resources.Listeners[i].AdditionalAddresses = reconciledL.AdditionalAddresses
+					}
+				}
+			}
+		}
 	}
 
 	err := ops.xds.UpdateEnvoyResources(ctx, prevResources, resources)
 
 	if err != nil && isPortBindingError(err) {
-		ops.log.Warn("Port binding failed, attempting to reallocate ports and retry",
-			logfields.Error, err)
+		hasDynamicallyAllocatedPorts := false
+		if len(resources.PortAllocationCallbacks) > 0 {
+			for _, listener := range resources.Listeners {
+				if listener.GetInternalListener() != nil {
+					continue
+				}
+				if _, exists := resources.PortAllocationCallbacks[listener.Name]; exists {
+					hasDynamicallyAllocatedPorts = true
+					break
+				}
+			}
+		}
 
-		retryResources := resources
-		retryErr := ops.retryWithNewPorts(ctx, prevResources, retryResources)
-		if retryErr == nil {
-			resources = retryResources
-			err = nil
+		if hasDynamicallyAllocatedPorts {
+			ops.log.Warn("Port binding failed, attempting to reallocate ports and retry",
+				logfields.Error, err)
+
+			updatedResources, retryErr := ops.retryWithNewPorts(ctx, prevResources, resources)
+			if retryErr == nil {
+				resources = updatedResources
+				err = nil
+			} else {
+				ops.log.Error("Failed to retry with new ports after binding failure",
+					logfields.Error, retryErr)
+				return fmt.Errorf("failed to reallocate ports after binding failure: %w (original error: %w)", retryErr, err)
+			}
 		} else {
-			ops.log.Error("Failed to retry with new ports after binding failure",
-				logfields.Error, retryErr)
-			return fmt.Errorf("failed to reallocate ports after binding failure: %w (original error: %w)", retryErr, err)
+			ops.log.Warn("Port binding failed, but no dynamically allocated ports to reallocate",
+				logfields.Error, err)
 		}
 	}
 
